@@ -1,10 +1,12 @@
-﻿using System;
+using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Net.Http;
 using System.Net.Http.Headers;
-using System.Text.Json;
-using System.Threading.Tasks;
 using System.Security.Cryptography;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
 
 public class AnythingLLMClient
 {
@@ -68,7 +70,6 @@ public class AnythingLLMClient
     }
 }
 
-
 public class FingerprintStore
 {
     private readonly string _jsonPath;
@@ -118,7 +119,6 @@ public class FingerprintStore
         }
     }
 
-    // Update in-memory only. Call Save() once after batch operations.
     public void SetFingerprint(string filePath, string fingerprint)
     {
         lock (_lock)
@@ -136,37 +136,53 @@ public class FingerprintStore
         }
     }
 }
+
 public class Program
 {
-    public static async Task Main(string[] args)
+    public static async Task<int> Main(string[] args)
     {
-        var client = new AnythingLLMClient(
-            baseUrl: "http://localhost:3001",
-            apiKey: "JKNNQQW-38E400B-N2CJNAN-2STY376"
-        );
+        AppSettings settings;
+        try
+        {
+            settings = SettingsLoader.Load(args);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"⚠️ Failed to load configuration: {ex.Message}");
+            return 1;
+        }
+
+        if (!Directory.Exists(settings.Directory))
+        {
+            Console.Error.WriteLine($"❌ Directory '{settings.Directory}' not found.");
+            return 1;
+        }
+
+        Console.WriteLine($"📁 Monitoring: {settings.Directory}");
+        Console.WriteLine($"🧠 Workspace: {settings.Workspace}");
+        if (settings.AllWorkspaces.Length > 1)
+            Console.WriteLine($" ➕ Additional workspaces: {string.Join(", ", settings.AllWorkspaces.Skip(1))}");
+        Console.WriteLine($"🗂️  Fingerprints file: {settings.FingerprintPath}");
+        if (settings.DryRun)
+            Console.WriteLine("🚫 DRY RUN — uploads will be skipped.");
+
+        var client = new AnythingLLMClient(settings.BaseUrl, settings.ApiKey);
 
         Console.WriteLine("A autenticar...");
         await client.AuthenticateAsync();
         Console.WriteLine("Autenticado com sucesso!");
 
-        // Directory to monitor
-        string directory = @"K:\n8n\RagFiles";
-        string workspace = "HTS";
+        var fpStore = new FingerprintStore(settings.FingerprintPath);
+        using var semaphore = new SemaphoreSlim(settings.MaxConcurrency);
 
-        // JSON where fingerprints are stored
-        var fpStore = new FingerprintStore("fingerprints.json");
-
-        // Control concurrency
-        int maxConcurrency = Math.Max(1, Environment.ProcessorCount);
-        using var semaphore = new SemaphoreSlim(maxConcurrency);
-
-        var files = Directory.GetFiles(directory, "*", SearchOption.AllDirectories);
+        var files = Directory.GetFiles(settings.Directory, "*", SearchOption.AllDirectories);
         var tasks = new List<Task>();
         var failures = new List<(string file, Exception ex)>();
-
-        // === progresso global ===
         int totalFilesToUpload = 0;
         int completedUploads = 0;
+
+        var workspaceList = string.Join(',', settings.AllWorkspaces);
+        var metadataJson = settings.Metadata.Count == 0 ? "{}" : JsonSerializer.Serialize(settings.Metadata);
 
         foreach (var file in files)
         {
@@ -190,17 +206,13 @@ public class Program
                 continue;
             }
 
-            // Build folder path based on relative path to preserve subfolders
-            var relative = Path.GetRelativePath(directory, file).Replace("\\", "/");
+            var relative = Path.GetRelativePath(settings.Directory, file).Replace("\\", "/");
             var relativeDir = Path.GetDirectoryName(relative)?.Replace("\\", "/") ?? string.Empty;
-            string folder = string.IsNullOrEmpty(relativeDir) ? workspace : $"{workspace}/{relativeDir}";
+            string folder = string.IsNullOrEmpty(relativeDir) ? settings.Workspace : $"{settings.Workspace}/{relativeDir}";
 
             Console.WriteLine("🔄 Changed — scheduling upload...");
-
-            // incrementa contador global
             Interlocked.Increment(ref totalFilesToUpload);
 
-            // Start upload task
             var task = Task.Run(async () =>
             {
                 await semaphore.WaitAsync();
@@ -208,20 +220,25 @@ public class Program
                 {
                     Console.WriteLine($"⤴️ Uploading {file} to {folder} ...");
 
-                    var result = await client.UploadFileAsync(
-                        filePath: file,
-                        addToWorkspaces: workspace,
-                        folder: folder
-                    );
+                    if (!settings.DryRun)
+                    {
+                        await client.UploadFileAsync(
+                            filePath: file,
+                            addToWorkspaces: workspaceList,
+                            metadataJson: metadataJson,
+                            folder: folder
+                        );
 
-                    Console.WriteLine($"✔️ Upload completed: {file}");
-                    //Console.WriteLine(result);
+                        Console.WriteLine($"✔️ Upload completed: {file}");
+                        fpStore.SetFingerprint(file, fingerprint);
+                    }
+                    else
+                    {
+                        Console.WriteLine("(dry run) Upload skipped");
+                    }
 
-                    fpStore.SetFingerprint(file, fingerprint);
-
-                    // === Progresso geral ===
                     int done = Interlocked.Increment(ref completedUploads);
-                    Console.WriteLine($"📤 Progresso geral: {done}/{totalFilesToUpload} ficheiros ({(done * 100.0 / totalFilesToUpload):F1}%)");
+                    Console.WriteLine($"📤 Progresso geral: {done}/{totalFilesToUpload} ficheiros ({(done * 100.0 / Math.Max(1, totalFilesToUpload)):F1}%)");
                 }
                 catch (Exception ex)
                 {
@@ -240,21 +257,25 @@ public class Program
             tasks.Add(task);
         }
 
-        // Wait for all uploads
         await Task.WhenAll(tasks);
 
-        // Save fingerprints
-        try
+        if (!settings.DryRun)
         {
-            fpStore.Save();
-            Console.WriteLine("\n📦 Fingerprints saved.");
+            try
+            {
+                fpStore.Save();
+                Console.WriteLine("\n📦 Fingerprints saved.");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"⚠️ Failed to save fingerprints: {ex.Message}");
+            }
         }
-        catch (Exception ex)
+        else
         {
-            Console.WriteLine($"⚠️ Failed to save fingerprints: {ex.Message}");
+            Console.WriteLine("\n(Dry run) Fingerprints were not persisted.");
         }
 
-        // Summary
         Console.WriteLine($"\nDone. Processed {files.Length} files. Uploaded: {completedUploads}, Failed: {failures.Count}.");
 
         if (failures.Count > 0)
@@ -263,9 +284,7 @@ public class Program
             foreach (var f in failures)
                 Console.WriteLine($"- {f.file}: {f.ex.Message}");
         }
+
+        return failures.Count == 0 ? 0 : 2;
     }
-
-
 }
-
-
